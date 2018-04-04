@@ -2,105 +2,216 @@
  * Created by Samuel Gratzl on 08.02.2016.
  */
 
-//the OpenGL context
-var gl = null;
-//our shader program
-var program = null;
-//links to buffer stored on the GPU
-var buffer, colorBuffer;
+ 'use strict';
+
+ //the OpenGL context
+ var gl = null;
+ const camera = {
+   rotation: {
+     x: 0,
+     y: 0
+   }
+ };
+
+ //scene graph nodes
+ var root = null;
+//textures
+var skycubetexture;
+
+var mipmapping_enabled = false;
+var anisotropicfiltering_enabled = false;
+
+//load the shader resources using a utility function
+loadResources({
+  vs_env: 'shader/env.vs.glsl',
+  fs_env: 'shader/env.fs.glsl',
+  env_pos_x: 'res/cubemap/env_pos_x.jpg',
+  env_pos_y: 'res/cubemap/env_pos_y.jpg',
+  env_pos_z: 'res/cubemap/env_pos_z.jpg',
+  env_neg_x: 'res/cubemap/env_pos_neg_x.jpg',
+  env_neg_y: 'res/cubemap/env_pos_neg_y.jpg',
+  env_neg_z: 'res/cubemap/env_pos_neg_z.jpg',
+  model: 'res/royalstarship.obj'
+}).then(function (resources /*an object containing our keys with the loaded resources*/) {
+  init(resources);
+
+  //render one frame
+  render(0);
+});
+
+
 
 /**
  * initializes OpenGL context, compile shader, and load buffers
  */
 function init(resources) {
   //create a GL context
-  gl = createContext(400 /*width*/, 400 /*height*/);
+  gl = createContext();
+ skycubetexture = createCubeMap(resources);
+  gl.enable(gl.DEPTH_TEST);
 
+  //create scenegraph
+  root = createSceneGraph(gl, resources);
+  initInteraction(gl.canvas);
+}
+
+function createSceneGraph(gl, resources) {
+  //create scenegraph
   //in WebGL/OpenGL3 we have to create and use our own shaders for the programmable pipeline
   //create the shader program
-  shaderProgram = createProgram(gl, resources.vs, resources.fs);
+  const root = new ShaderSGNode(createProgram(gl, resources.vs_env, resources.fs_env));
 
-  //create a buffer and put a single clipspace rectangle in it (2 triangles)
-  buffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  //we need typed arrays
-  const arr = new Float32Array([
-    -1.0, -1.0,
-    1.0, -1.0,
-    -1.0, 1.0,
-    -1.0, 1.0,
-    1.0, -1.0,
-    1.0, 1.0]);
-  //copy data to GPU
-  gl.bufferData(gl.ARRAY_BUFFER, arr, gl.STATIC_DRAW);
+  {
+    //add skybox by putting large sphere around us
+    var sky = new EnvironmentSGNode(skycubetexture,4,false,
+                    new RenderSGNode(makeSphere(50)));
+    root.append(sky);
+  }
 
-  //same for the color
-  colorBuffer = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-  const colors = new Float32Array([
-    1, 0, 0, 1,
-    0, 1, 0, 1,
-    0, 0, 1, 1,
-    0, 0, 1, 1,
-    0, 1, 0, 1,
-    0, 0, 0, 1]);
-  gl.bufferData(gl.ARRAY_BUFFER, colors, gl.STATIC_DRAW);
+  {
+    //initialize starship
+    let starship = new TransformationSGNode(glm.transform({ translate: [0,0, 1], rotateX : 90, rotateZ : 90, scale: 1.0 }),
+                   new EnvironmentSGNode(skycubetexture,4,true,
+                   new RenderSGNode(resources.model)));
+
+    root.append(starship);
+  }
+
+  return root;
 }
 
-/**
- * render one frame
- */
-function render() {
-  //specify the clear color
+
+//a scene graph node for setting environment mapping parameters
+class EnvironmentSGNode extends SGNode {
+
+  constructor(envtexture, textureunit, doReflect , children ) {
+      super(children);
+      this.envtexture = envtexture;
+      this.textureunit = textureunit;
+      this.doReflect = doReflect;
+  }
+
+  render(context)
+  {
+    //set additional shader parameters
+    let invView3x3 = mat3.fromMat4(mat3.create(), context.invViewMatrix); //reduce to 3x3 matrix since we only process direction vectors (ignore translation)
+    gl.uniformMatrix3fv(gl.getUniformLocation(context.shader, 'u_invView'), false, invView3x3);
+    gl.uniform1i(gl.getUniformLocation(context.shader, 'u_texCube'), this.textureunit);
+    gl.uniform1i(gl.getUniformLocation(context.shader, 'u_useReflection'), this.doReflect)
+
+    //activate and bind texture
+    gl.activeTexture(gl.TEXTURE0 + this.textureunit);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, this.envtexture);
+
+    //render children
+    super.render(context);
+
+    //clean up
+    gl.activeTexture(gl.TEXTURE0 + this.textureunit);
+    gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+  }
+}
+
+
+function render(timeInMilliseconds) {
+  checkForWindowResize(gl);
+
+  gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
   gl.clearColor(0.9, 0.9, 0.9, 1.0);
-  //clear the buffer
   gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
-  //activate this shader program
-  gl.useProgram(shaderProgram);
+  const context = createSGContext(gl);
+  context.projectionMatrix = mat4.perspective(mat4.create(), glm.deg2rad(30), gl.drawingBufferWidth / gl.drawingBufferHeight, 0.01, 100);
+  //very primitive camera implementation
+  let lookAtMatrix = mat4.lookAt(mat4.create(), [0,1,-10], [0,0,0], [0,1,0]);
+  let mouseRotateMatrix = mat4.multiply(mat4.create(),
+                          glm.rotateX(camera.rotation.y),
+                          glm.rotateY(camera.rotation.x));
+  context.viewMatrix = mat4.multiply(mat4.create(), lookAtMatrix, mouseRotateMatrix);
 
-  //we use a uniform to specify the rectangle color
-  //a uniform is like a parameter to a shader (vertex or fragment).
-  //however, the same value is used for all instances
-  var userColor = { r: 0.6, g: 0.2, b: 0.8};
-  gl.uniform3f(gl.getUniformLocation(shaderProgram, 'u_usercolor'),
-                userColor.r, userColor.g, userColor.b);
+  //get inverse view matrix to allow to compute viewing direction in world space for environment mapping
+  context.invViewMatrix = mat4.invert(mat4.create(), context.viewMatrix);
 
-  //attributes are used to specify per vertex shader instance data, e.g., the vertex position
+  root.render(context);
 
-  //we look up the internal location after compilation of the shader program given the name of the attribute
-  const positionLocation = gl.getAttribLocation(shaderProgram, 'a_position');
-
-  //enable this vertex attribute
-  gl.enableVertexAttribArray(positionLocation);
-  //use the currently bound buffer for this location
-  //each element is a FLOAT with 2 components
-  //2 .. number of components
-  //float ... type
-  //false ... the array should not be normalized
-  //stride / offset ... in case you are interleaving different attribute
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-  gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
-
-  const colorLocation = gl.getAttribLocation(shaderProgram, 'a_color');
-  gl.enableVertexAttribArray(colorLocation);
-  gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-  gl.vertexAttribPointer(colorLocation, 4, gl.FLOAT, false, 0, 0);
-
-  //draw the bound data as 6 vertices = 2 triangles starting at index 0
-  gl.drawArrays(gl.TRIANGLES, 0, 6);
-
-  //request another call as soon as possible
-  //requestAnimationFrame(render);
+  //animate
+  requestAnimationFrame(render);
 }
 
-//load the shader resources using a utility function
-loadResources({
-  vs: 'shader/simple.vs.glsl',
-  fs: 'shader/simple.fs.glsl'
-}).then(function (resources /*an object containing our keys with the loaded resources*/) {
-  init(resources);
-
-  //render one frame
-  render();
-});
+//camera control
+function initInteraction(canvas) {
+  const mouse = {
+    pos: { x : 0, y : 0},
+    leftButtonDown: false
+  };
+  function toPos(event) {
+    //convert to local coordinates
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: event.clientX - rect.left,
+      y: event.clientY - rect.top
+    };
+  }
+  canvas.addEventListener('mousedown', function(event) {
+    mouse.pos = toPos(event);
+    mouse.leftButtonDown = event.button === 0;
+  });
+  canvas.addEventListener('mousemove', function(event) {
+    const pos = toPos(event);
+    const delta = { x : mouse.pos.x - pos.x, y: mouse.pos.y - pos.y };
+    if (mouse.leftButtonDown) {
+      //add the relative movement of the mouse to the rotation variables
+  		camera.rotation.x += delta.x;
+  		camera.rotation.y += delta.y;
+    }
+    mouse.pos = pos;
+  });
+  canvas.addEventListener('mouseup', function(event) {
+    mouse.pos = toPos(event);
+    mouse.leftButtonDown = false;
+  });
+  //register globally
+  document.addEventListener('keypress', function(event) {
+    //https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent
+    if (event.code === 'KeyR') {
+      camera.rotation.x = 0;
+  		camera.rotation.y = 0;
+    }
+    if (event.code === 'KeyM') {
+      //enable/disable mipmapping
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_CUBE_MAP, envcubetexture);
+      mipmapping_enabled = !mipmapping_enabled;
+      if(mipmapping_enabled)
+      {
+        console.log('Mipmapping enabled');
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      }
+      else
+      {
+        console.log('Mipmapping disabled');
+        gl.texParameteri(gl.TEXTURE_CUBE_MAP, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      }
+      gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+    }
+    if (event.code === 'KeyA') {
+      //enable/disable anisotropic filtering (only visible in combination with mipmapping)
+      var ext = gl.getExtension("WEBKIT_EXT_texture_filter_anisotropic");
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_CUBE_MAP, envcubetexture);
+      anisotropicfiltering_enabled = !anisotropicfiltering_enabled;
+      if(anisotropicfiltering_enabled)
+      {
+        console.log('Anisotropic filtering enabled');
+        var max_anisotropy = gl.getParameter(ext.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+        gl.texParameterf(gl.TEXTURE_CUBE_MAP, ext.TEXTURE_MAX_ANISOTROPY_EXT, max_anisotropy);
+      }
+      else
+      {
+        console.log('Anisotropic filtering disabled');
+        gl.texParameterf(gl.TEXTURE_CUBE_MAP, ext.TEXTURE_MAX_ANISOTROPY_EXT, 1);
+      }
+      gl.bindTexture(gl.TEXTURE_CUBE_MAP, null);
+    }
+  });
+}
